@@ -1,15 +1,18 @@
 from hexoweb.views import *
-from django.urls import path, re_path
+from django.urls import path, re_path, include
+from django.conf.urls import url
 # from django.contrib import admin
-# from django.views.static import serve
+from django.views.static import serve
 # from django.conf import settings
 import hexoweb.pub as pub
 from django.views.generic import TemplateView
 
 urlpatterns = [
     # path('admin/', admin.site.urls),
-    # re_path(r'^static/(?P<path>.*)$', serve, {'document_root': settings.STATIC_ROOT},
-    #         name='static'),
+    re_path(r'^static/(?P<path>.*)$', serve, {'document_root': "static"},
+            name='static'),
+
+    # url(r'^passkeys/', include('passkeys.urls')),
 
     path('robots.txt', TemplateView.as_view(template_name='robots.txt', content_type='text/plain')),
 
@@ -25,7 +28,10 @@ urlpatterns = [
     path('api/save_post/', save_post, name='save_post'),
     path('api/save_page/', save_page, name='save_page'),
     path('api/save_draft/', save_draft, name='save_draft'),
+    path('api/publish/', publish_post, name='publish'),
+    path('api/unpublish/', unpublish_post, name='unpublish'),
     path('api/new_page/', new_page, name='new_page'),
+    path('api/new_post/', new_post, name='new_post'),
     path('api/delete/', delete, name='delete'),
     path('api/rename/', rename, name='rename'),
     path('api/upload/', upload_img, name='upload'),
@@ -64,10 +70,9 @@ urlpatterns = [
     path('api/save_talk/', save_talk, name='save_talk'),
     path('api/del_talk/', del_talk, name='del_talk'),
     path('api/run_online_script/', run_online_script, name='run_online_script'),
+    path('api/change_lang/', change_lang, name='change_lang'),
 
     path('pub/save/', pub.save, name='pub_save'),
-    path('pub/save_post/', pub.save_post, name='pub_save_post'),
-    path('pub/save_draft/', pub.save_draft, name='pub_save_draft'),
     path('pub/delete/', pub.delete, name='pub_delete'),
     path('pub/create_webhook/', pub.create_webhook_config, name='pub_create_webhook'),
     path('pub/get_posts/', pub.get_posts, name='pub_get_posts'),
@@ -76,6 +81,7 @@ urlpatterns = [
     path('pub/get_images/', pub.get_images, name='pub_get_images'),
     path('pub/fix/', pub.auto_fix, name='pub_auto_fix'),
     path('pub/friends/', pub.friends, name='pub_friends'),
+    path('pub/get_friends/', pub.get_friends, name='pub_get_friends'),
     path('pub/ask_friend/', pub.ask_friend, name='pub_ask_friend'),
     path('pub/add_friend/', pub.add_friend, name='pub_add_friend'),
     path('pub/edit_friend/', pub.edit_friend, name='pub_edit_friend'),
@@ -84,7 +90,6 @@ urlpatterns = [
     path('pub/get_notifications/', pub.get_notifications, name='pub_get_notifications'),
     path('pub/status/', pub.status, name='pub_status'),
     path('pub/statistic/', pub.statistic, name='pub_statistic'),
-    path('pub/waline/', pub.waline, name='pub_waline'),
     path('pub/set_custom/', pub.set_custom, name='pub_set_custom'),
     path('pub/del_custom/', pub.del_custom, name='pub_del_custom'),
     path('pub/new_custom/', pub.new_custom, name='pub_new_custom'),
@@ -93,8 +98,9 @@ urlpatterns = [
     path('pub/like_talk/', pub.like_talk, name='pub_like_talk'),
     path('pub/save_talk/', pub.save_talk, name='pub_save_talk'),
     path('pub/del_talk/', pub.del_talk, name='pub_del_talk'),
+    path('pub/get_all_talks/', pub.get_all_talks, name='pub_get_all_talks'),
 
-    re_path(r'^(?!api)^(?!pub).*$\.*', pages, name='pages'),
+    re_path(r'^(?!api)^(?!static)^(?!pub).*$\.*', pages, name='pages'),
 ]
 
 handler404 = page_404

@@ -21,17 +21,22 @@ from markdown import markdown
 from urllib3 import disable_warnings
 from urllib.parse import quote, unquote
 
+import hexoweb.libs.i18n
 from core.qexoSettings import ALL_SETTINGS
-from core.qexoSettings import QEXO_VERSION
+from core.qexoSettings import QEXO_VERSION, QEXO_STATIC, VDITOR_LANGUAGES
+from core.settings import DATABASES
 from hexoweb.libs.elevator import elevator
 from hexoweb.libs.onepush import notify
 from hexoweb.libs.platforms import get_provider
-from .models import Cache, SettingModel, FriendModel, NotificationModel, CustomModel, StatisticUV, StatisticPV, ImageModel, TalkModel, \
+from hexoweb.libs.i18n import get_language
+from .models import Cache, SettingModel, FriendModel, NotificationModel, CustomModel, StatisticUV, StatisticPV, \
+    ImageModel, TalkModel, \
     PostModel
 
 disable_warnings()
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s(%(filename)s.%(funcName)s[line:%(lineno)d])',
+logging.basicConfig(level=logging.INFO,
+                    format='[%(asctime)s] %(levelname)s: %(message)s(%(filename)s.%(funcName)s[line:%(lineno)d])',
                     datefmt="%d/%b/%Y %H:%M:%S")
 
 
@@ -40,6 +45,36 @@ def get_setting(name):
         return SettingModel.objects.get(name=name).content
     except Exception:
         return ""
+
+
+def update_language():
+    global _Language
+    _Language = get_setting("LANGUAGE")
+    if not _Language:
+        save_setting("LANGUAGE", "zh_CN")
+        _Language = "zh_CN"
+    _Language = get_language(_Language).default
+    return _Language
+
+
+try:
+    _Language = update_language()
+except Exception:
+    logging.error("Language获取失败, 默认为zh_CN")
+    _Language = get_language("zh_CN").default
+
+
+def Language():
+    try:
+        return _Language
+    except Exception:
+        logging.error(gettext("ERROR_GETTING_PROVIDER") + ": " + gettext("RETRY"))
+        return update_language()
+
+
+@register.filter
+def gettext(value):
+    return Language()["data"].get(value, value)
 
 
 def update_provider():
@@ -52,14 +87,14 @@ def update_provider():
 try:
     _Provider = update_provider()
 except Exception:
-    logging.error("Provider获取失败, 跳过")
+    logging.error(gettext("ERROR_GETTING_PROVIDER") + ": " + gettext("JUMPED"))
 
 
 def Provider():
     try:
         return _Provider
     except Exception:
-        logging.error("Provider获取错误, 重新获取")
+        logging.error(gettext("ERROR_GETTING_PROVIDER") + ": " + gettext("RETRY"))
         return update_provider()
 
 
@@ -86,9 +121,13 @@ def excerpt(value, length):
 def get_cdn():
     cdn_prev = get_setting("CDN_PREV")
     if not cdn_prev:
-        save_setting("CDN_PREV", "https://unpkg.com/")
-        cdn_prev = "https://unpkg.com/"
-    return cdn_prev
+        cdn_prev = "https://registry.npmmirror.com/qexo-static/{version}/files/qexo"
+        for i in ALL_SETTINGS:
+            if i[0] == "CDN_PREV":
+                cdn_prev = i[1]
+                break
+        save_setting("CDN_PREV", cdn_prev)
+    return cdn_prev.format(version=QEXO_STATIC)
 
 
 # def get_cdnjs():
@@ -101,9 +140,11 @@ def get_cdn():
 
 # 获取用户自定义的样式配置
 def get_custom_config():
-    context = {"cdn_prev": get_cdn(), "QEXO_NAME": get_setting("QEXO_NAME")}
+    context = {"cdn_prev": get_cdn(), "QEXO_NAME": get_setting("QEXO_NAME"),
+               "language": Language().get("name", "zh_CN"), "vditor_languages": VDITOR_LANGUAGES,
+               "all_languages": hexoweb.libs.i18n.all_languages()}
     if not context["QEXO_NAME"]:
-        save_setting('QEXO_NAME', 'Hexo管理面板')
+        save_setting('QEXO_NAME', 'Hexo' + gettext("CONSOLE"))
         context["QEXO_NAME"] = get_setting("QEXO_NAME")
     context["QEXO_SPLIT"] = get_setting("QEXO_SPLIT")
     if not context["QEXO_SPLIT"]:
@@ -112,17 +153,17 @@ def get_custom_config():
     context["QEXO_LOGO"] = get_setting("QEXO_LOGO")
     if not context["QEXO_LOGO"]:
         save_setting('QEXO_LOGO',
-                     'https://unpkg.com/qexo-static@2.2.3/qexo/images/qexo.png')
+                     'https://unpkg.com/qexo-static@' + QEXO_STATIC + '/qexo/images/qexo.png')
         context["QEXO_LOGO"] = get_setting("QEXO_LOGO")
     context["QEXO_LOGO_DARK"] = get_setting("QEXO_LOGO_DARK")
     if not context["QEXO_LOGO_DARK"]:
         save_setting('QEXO_LOGO_DARK',
-                     'https://unpkg.com/qexo-static@2.2.3/qexo/images/qexo-dark.png')
+                     'https://unpkg.com/qexo-static@' + QEXO_STATIC + '/qexo/images/qexo-dark.png')
         context["QEXO_LOGO_DARK"] = get_setting("QEXO_LOGO_DARK")
     context["QEXO_ICON"] = get_setting("QEXO_ICON")
     if not context["QEXO_ICON"]:
         save_setting('QEXO_ICON',
-                     'https://unpkg.com/qexo-static@2.2.3/qexo/images/icon.png')
+                     'https://unpkg.com/qexo-static@' + QEXO_STATIC + '/qexo/images/icon.png')
         context["QEXO_ICON"] = get_setting("QEXO_ICON")
     return context
 
@@ -139,97 +180,67 @@ def update_caches(name, content, _type="json"):
     else:
         posts_cache.content = content
     posts_cache.save()
-    logging.info("重建{}缓存成功".format(name))
+    logging.info(gettext("REBUILD_CACHE_SUCCESS").format(name))
+
+
+def _filter_items_by_search(items, search_term):
+    """过滤列表项，只保留名称中包含搜索词的项目"""
+    if not search_term:
+        return items
+
+    filtered_items = []
+    for item in items:
+        if search_term.upper() in item["name"].upper():
+            filtered_items.append(item)
+    return filtered_items
+
+
+def _get_cached_or_fresh_data(cache_name, provider_method, search_term=None):
+    """从缓存获取数据或通过provider获取新数据"""
+    # 检查是否有现有缓存
+    old_cache = Cache.objects.filter(name=cache_name)
+
+    # 如果没有缓存或需要搜索，获取完整结果
+    if not old_cache.count() or search_term:
+        try:
+            if old_cache.count():
+                # 有缓存但需要搜索，先尝试从缓存过滤
+                cached_data = json.loads(old_cache.first().content)
+                filtered_data = _filter_items_by_search(cached_data, search_term)
+                update_caches(f"{cache_name}.{search_term}", filtered_data)
+                return filtered_data
+        except Exception:
+            pass
+
+        # 获取新数据
+        results = provider_method()
+        update_caches(cache_name, results)
+
+        if search_term:
+            filtered_results = _filter_items_by_search(results, search_term)
+            update_caches(f"{cache_name}.{search_term}", filtered_results)
+            return filtered_results
+        return results
+
+    # 直接返回缓存
+    try:
+        return json.loads(old_cache.first().content)
+    except Exception:
+        results = provider_method()
+        update_caches(cache_name, results)
+        return results
 
 
 def update_posts_cache(s=None):
-    if s:
-        old_cache = Cache.objects.filter(name="posts")
-        if old_cache.count():
-            posts = json.loads(old_cache.first().content)
-            i = 0
-            while i < len(posts):
-                if s.upper() not in posts[i]["name"].upper():
-                    del posts[i]
-                    i -= 1
-                i += 1
-            cache_name = "posts." + str(s)
-            update_caches(cache_name, posts)
-            return posts
-    else:
-        old_cache = False
-    posts = Provider().get_posts()
-    if s:
-        if not old_cache.count():
-            update_caches("posts", posts)
-        i = 0
-        while i < len(posts):
-            if s.upper() not in posts[i]["name"].upper():
-                del posts[i]
-                i -= 1
-            i += 1
-    if s:
-        cache_name = "posts." + str(s)
-    else:
-        cache_name = "posts"
-    update_caches(cache_name, posts)
-    return posts
+    return _get_cached_or_fresh_data("posts", Provider().get_posts, s)
 
 
 def update_pages_cache(s=None):
-    if s:
-        old_cache = Cache.objects.filter(name="pages")
-        if old_cache.count():
-            posts = json.loads(old_cache.first().content)
-            i = 0
-            while i < len(posts):
-                if s.upper() not in posts[i]["name"].upper():
-                    del posts[i]
-                    i -= 1
-                i += 1
-            cache_name = "pages." + str(s)
-            update_caches(cache_name, posts)
-            return posts
-    results = Provider().get_pages()
-    update_caches("pages", results)
-    if not s:
-        return results
-    i = 0
-    while i < len(results):
-        if s.upper() not in results[i]["name"].upper():
-            del results[i]
-            i -= 1
-        i += 1
-    update_caches("pages." + str(s), results)
-    return results
+    return _get_cached_or_fresh_data("pages", Provider().get_pages, s)
 
 
 def update_configs_cache(s=None):
-    if s:
-        old_cache = Cache.objects.filter(name="configs")
-        if old_cache.count():
-            posts = json.loads(old_cache.first().content)
-            i = 0
-            while i < len(posts):
-                if s.upper() not in posts[i]["name"].upper():
-                    del posts[i]
-                    i -= 1
-                i += 1
-            cache_name = "configs." + str(s)
-            update_caches(cache_name, posts)
-            return posts
-    results = Provider().get_configs()
-    update_caches("configs", results)
-    if not s:
-        return results
-    i = 0
-    while i < len(results):
-        if s.upper() not in results[i]["name"].upper():
-            del results[i]
-            i -= 1
-        i += 1
-    update_caches("configs." + str(s), results)
-    return results
+    return _get_cached_or_fresh_data("configs", Provider().get_configs, s)
 
 
 def delete_all_caches():
@@ -237,7 +248,7 @@ def delete_all_caches():
     for cache in caches:
         if cache.name != "update":
             cache.delete()
-    logging.info("清除全部缓存成功")
+    logging.info(gettext("PURGE_ALL_CACHE_SUCCESS"))
 
 
 def save_setting(name, content):
@@ -256,7 +267,7 @@ def save_setting(name, content):
     else:
         new_set.content = ""
     new_set.save()
-    logging.info("保存设置{} => {}".format(name, content if name != "PROVIDER" else "******"))
+    logging.info(gettext("SAVE_SETTING") + "{} => {}".format(name, content if name != "PROVIDER" else "******"))
     return new_set
 
 
@@ -276,7 +287,7 @@ def save_custom(name, content):
     else:
         new_set.content = ""
     new_set.save()
-    logging.info("保存自定义字段{} => {}".format(name, content))
+    logging.info(gettext("SAVE_CUSTOM") + "{} => {}".format(name, content))
     return new_set
 
 
@@ -298,10 +309,10 @@ def get_latest_version():
                 "%Y-%m-%d %H:%M:%S")
             context["newer_text"] = markdown(latest.body).replace("\n", "")
             context["status"] = True
-            logging.info("获取更新成功: {} {}".format(latest.tag_name, context["newer_time"]))
+            logging.info(gettext("GET_UPDATE_SUCCESS") + ": {} {}".format(latest.tag_name, context["newer_time"]))
         else:
             latest = requests.get("https://api.github.com/repos/Qexo/Qexo/releases/latest").json()
-            logging.info("获取更新成功: {}".format(latest["tag_name"]))
+            logging.info(gettext("GET_UPDATE_SUCCESS") + ": {}".format(latest["tag_name"]))
             if latest["tag_name"] and (latest["tag_name"] != QEXO_VERSION):
                 context["hasNew"] = True
             else:
@@ -314,7 +325,7 @@ def get_latest_version():
             context["newer_text"] = markdown(latest["body"]).replace("\n", "")
             context["status"] = True
     except Exception as e:
-        logging.error("获取更新错误: " + repr(e))
+        logging.error(gettext("GET_UPDATE_FAILED") + ": " + repr(e))
         context["status"] = False
     return context
 
@@ -325,13 +336,26 @@ def check_if_api_auth(request):
     if request.GET.get("token") == get_setting("WEBHOOK_APIKEY"):
         return True
     logging.info(
-        request.path + ": API鉴权失败 访问IP " + (
-            request.META['HTTP_X_FORWARDED_FOR'] if 'HTTP_X_FORWARDED_FOR' in request.META.keys() else request.META['REMOTE_ADDR']))
+        request.path + ":" + gettext("API_VERIFY_FAILED").format(
+            request.META['HTTP_X_FORWARDED_FOR'] if 'HTTP_X_FORWARDED_FOR' in request.META.keys() else request.META[
+                'REMOTE_ADDR']))
     return False
 
 
 def check_if_vercel():
-    return True if os.environ.get("VERCEL") else False
+    if os.environ.get("VERCEL"):
+        return True
+    if get_setting("FORCE_VERCEL"):
+        return True
+    return False
+
+
+def check_if_docker():
+    if os.environ.get("DOCKER"):
+        return True
+    if get_setting("FORCE_DOCKER"):
+        return True
+    return False
 
 
 def get_crc16(x, _hex=False):
@@ -383,9 +407,9 @@ def fix_all(all_settings=ALL_SETTINGS):
             additions.append(setting[0])
             save_setting(setting[0], setting[1])
             counter += 1
-    logging.info("已修复{}个设置".format(counter))
-    logging.info("删除字段" + str(deleted))
-    logging.info("修正字段" + str(additions))
+    logging.info(gettext("FIX_SUCCESS").format(counter))
+    logging.info(gettext("DEL_VALUE") + str(deleted))
+    logging.info(gettext("FIX_VALUE") + str(additions))
     return counter
 
 
@@ -410,6 +434,7 @@ def checkBuilding(projectId, token):
 
 def file_get_contents(file):
     with open(file, 'r', encoding="utf8") as f:
+        logging.info(gettext("READ_FILE") + ": " + file)
         content = f.read()
     return content
 
@@ -454,8 +479,8 @@ def get_update_url(target):
 
 def VercelUpdate(appId, token, sourcePath=""):
     if checkBuilding(appId, token):
-        logging.error("更新失败: 当前有部署正在进行")
-        return {"status": False, "msg": "更新失败, 当前有部署正在进行"}
+        logging.error(gettext("UPDATE_QUEUING"))
+        return {"status": False, "msg": gettext("UPDATE_QUEUING")}
     url = "https://api.vercel.com/v13/deployments"
     header = dict()
     data = dict()
@@ -468,9 +493,9 @@ def VercelUpdate(appId, token, sourcePath=""):
         sourcePath = os.path.abspath("")
     data["files"] = getEachFiles(sourcePath)
     response = requests.post(url, data=json.dumps(data), headers=header)
-    logging.info("更新完成: " + response.text)
+    logging.info(gettext("UPDATE_SUCCESS") + ": " + response.text)
     filelist = os.listdir("/tmp")
-    logging.info("开始删除文件...")
+    logging.info(gettext("START_DEL"))
     for filename in filelist:  # delete all files except tmp
         try:
             if os.path.isfile("/tmp/" + filename):
@@ -480,12 +505,12 @@ def VercelUpdate(appId, token, sourcePath=""):
             else:
                 pass
         except Exception as e:
-            logging.error("删除失败: " + repr(e))
+            logging.error(gettext("DEL_FAILED") + ": " + repr(e))
     return {"status": True, "msg": response.json()}
 
 
 def VercelOnekeyUpdate(url):
-    logging.info("开始更新, 使用Vercel方案")
+    logging.info(gettext("START_VERCEL_UPDATE"))
     vercel_config = get_project_detail()
     tmpPath = '/tmp'
     # 从github下载对应tar.gz，并解压
@@ -493,32 +518,33 @@ def VercelOnekeyUpdate(url):
     _tarfile = tmpPath + '/github.tar.gz'
     with open(_tarfile, "wb") as file:
         file.write(requests.get(url).content)
-    logging.info("下载更新完成, 开始解压")
+    logging.info(gettext("START_EXTRACT_UPDATE"))
     # logging.info("ext files")
     t = tarfile.open(_tarfile)
     t.extractall(path=tmpPath)
     t.close()
     os.remove(_tarfile)
-    logging.info("解压完成, 寻找Index目录")
+    logging.info(gettext("FIND_UPDATE_INDEX"))
     outPath = os.path.abspath(tmpPath + getIndexFile(tmpPath))
     # logging.info("outPath: " + outPath)
     if outPath == '':
-        return {"status": False, "msg": '更新失败: 未找到Index目录'}
-    logging.info("找到Index目录: " + outPath)
+        return {"status": False, "msg": gettext("FIND_INDEX_FAILED")}
+    logging.info(gettext("FIND_INDEX_SUCCESS") + ": " + outPath)
     return VercelUpdate(vercel_config["id"], vercel_config["token"], outPath)
 
 
 def copy_all_files(src_dir, dst_dir):
     if not os.path.exists(dst_dir):
         os.makedirs(dst_dir)
-    if os.path.exists(src_dir):
-        for file in os.listdir(src_dir):
-            file_path = os.path.join(src_dir, file)
-            dst_path = os.path.join(dst_dir, file)
-            if os.path.isfile(os.path.join(src_dir, file)):
-                shutil.copyfile(file_path, dst_path)
-            else:
-                shutil.copytree(file_path, dst_path)
+    for file in os.listdir(src_dir):
+        file_path = os.path.join(src_dir, file)
+        dst_path = os.path.join(dst_dir, file)
+        if os.path.exists(dst_path):
+            continue
+        if os.path.isfile(os.path.join(src_dir, file)):
+            shutil.copyfile(file_path, dst_path)
+        else:
+            shutil.copytree(file_path, dst_path)
 
 
 def pip_main(args):
@@ -535,23 +561,25 @@ def pip_main(args):
 
 
 def LocalOnekeyUpdate(url):
-    logging.info("开始更新, 使用本地方案, 准备临时目录")
+    import threading
+    logging.info(gettext("START_LOCAL_UPDATE"))
     Path = os.path.abspath("")
     tmpPath = os.path.abspath("./_tmp")
-    if not os.path.exists(tmpPath):
-        os.mkdir(tmpPath)
+    if os.path.exists(tmpPath):
+        shutil.rmtree(tmpPath)
+    os.mkdir(tmpPath)
     _tarfile = tmpPath + '/github.tar.gz'
     with open(_tarfile, "wb") as file:
         file.write(requests.get(url).content)
-    logging.info("下载更新完成, 正在解压缩...")
+    logging.info(gettext("START_EXTRACT_UPDATE"))
     t = tarfile.open(_tarfile)
     t.extractall(path=tmpPath)
     t.close()
     os.remove(_tarfile)
     outPath = os.path.abspath(tmpPath + getIndexFile(tmpPath))
-    logging.info("找到Index目录: " + outPath)
+    logging.info(gettext("FIND_INDEX_SUCCESS") + ": " + outPath)
     filelist = os.listdir(Path)
-    logging.info("开始删除旧文件...")
+    logging.info(gettext("START_DEL"))
     for filename in filelist:  # delete all files except tmp
         if filename not in ["_tmp", "configs.py", "db"]:
             if os.path.isfile(filename):
@@ -560,25 +588,38 @@ def LocalOnekeyUpdate(url):
                 shutil.rmtree(filename)
             else:
                 pass
-    logging.info("删除完成, 正在拷贝文件...")
+    logging.info(gettext("START_COPY"))
     copy_all_files(outPath, Path)
-    logging.info("删除临时目录")
+    os.chmod(Path + "/entrypoint.sh", 0o755)
+    logging.info(gettext("DEL_TMP"))
     shutil.rmtree(tmpPath)
-    logging.info("开始更新库...")
-    pip_main(['install', '-r', 'requirements.txt'])
-    logging.info("开始迁移数据库")
+    logging.info(gettext("UPDATE_LIB"))
+    if check_if_docker():
+        pip_main(['install', '-r', 'requirements-slim.txt'])
+    else:
+        pip_main(['install', '-r', 'requirements.txt'])
+    logging.info(gettext("MIGRATE_DB"))
     execute_from_command_line(['manage.py', 'makemigrations'])
     execute_from_command_line(['manage.py', 'migrate'])
-    logging.info("更新完成，五秒后重启线程")
-    import threading
+    logging.info(gettext("LOCAL_UPDATE_SUCCESS"))
     t = threading.Thread(target=lambda: rerun(5))
     t.start()
-    return {"status": True, "msg": "更新成功!"}
+    return {"status": True, "msg": gettext("UPDATE_SUCCESS")}
+
+
+def is_runserver():
+    import sys
+    current_command = sys.argv[1] if len(sys.argv) > 1 else ''
+    return current_command == 'runserver'
 
 
 def rerun(wait):
     sleep(wait)
-    os._exit(3)
+    if is_runserver():
+        os._exit(3)
+    else:
+        import signal
+        os.kill(os.getpid(), signal.SIGHUP)
 
 
 def CreateNotification(label, content, now):
@@ -623,11 +664,11 @@ def notify_me(title, content):
         text_maker = ht.HTML2Text()
         text_maker.bypass_tables = False
         content = text_maker.handle(content)
-    ntfy = notify(config["notifier"], **config["params"], title="Qexo消息: " + title, content=content)
+    ntfy = notify(config["notifier"], **config["params"], title=gettext("QEXO_MSG") + ": " + title, content=content)
     try:
         return ntfy.text
     except Exception:
-        logging.info("通知类型无输出信息, 使用OK缺省")
+        # logging.info("通知类型无输出信息, 使用OK缺省")
         return "OK"
 
 
@@ -637,7 +678,6 @@ def get_domain(domain):
 
 def verify_provider(provider):
     try:
-        logging.info("开始验证Provider: " + provider["provider"])
         provider = get_provider(provider["provider"], **provider["params"])
         home = provider.get_path("")
         hexo = 0
@@ -653,40 +693,35 @@ def verify_provider(provider):
         for file in home["data"]:
             if file["name"] == "index.html" and file["type"] == "file":
                 indexhtml = 1
-                logging.info("检测到错误的index.html")
             if file["name"] == "source" and file["type"] == "dir":
                 source = 1
-                logging.info("检测到source目录")
             if file["name"] == "themes" and file["type"] == "dir":
                 theme_dir = 1
-                logging.info("检测到themes目录")
             if file["name"] == "package.json" and file["type"] == "file":
                 pack = "package.json"
-                logging.info("检测到package.json")
             if file["name"] == "_config.yml" and file["type"] == "file":
                 config_hexo = "_config.yml"
-                logging.info("检测到根目录_config.yml")
-        # 读取主题 校验主题配置
-        try:
-            if config_hexo:
-                res = provider.get_content("_config.yml")
-                content = yaml.unsafe_load(res)
-                if content.get("theme"):
-                    theme = str(content.get("theme"))
-                    for file in home["data"]:
-                        if file["name"] == "_config.{}.yml".format(theme) and file["type"] == "file":
-                            config_theme = "_config.{}.yml".format(theme)
-                            logging.info("检测到主题配置文件: _config.{}.yml".format(theme))
-                            break
-                    if (not config_theme) and theme_dir:
-                        theme_path = provider.get_path("themes/" + theme)
-                        for file in theme_path["data"]:
-                            if file["name"] == "_config.yml" and file["type"] == "file":
-                                config_theme = "themes/" + theme + "/_config.yml"
-                                logging.info("检测到主题配置文件: themes/" + theme + "/_config.yml")
-                                break
-        except Exception as e:
-            logging.error("校验配置报错" + repr(e))
+        # # 读取主题 校验主题配置
+        # try:
+        #     if config_hexo:
+        #         res = provider.get_content("_config.yml")
+        #         content = yaml.unsafe_load(res)
+        #         if content.get("theme"):
+        #             theme = str(content.get("theme"))
+        #             for file in home["data"]:
+        #                 if file["name"] == "_config.{}.yml".format(theme) and file["type"] == "file":
+        #                     config_theme = "_config.{}.yml".format(theme)
+        #                     logging.info("检测到主题配置文件: _config.{}.yml".format(theme))
+        #                     break
+        #             if (not config_theme) and theme_dir:
+        #                 theme_path = provider.get_path("themes/" + theme)
+        #                 for file in theme_path["data"]:
+        #                     if file["name"] == "_config.yml" and file["type"] == "file":
+        #                         config_theme = "themes/" + theme + "/_config.yml"
+        #                         logging.info("检测到主题配置文件: themes/" + theme + "/_config.yml")
+        #                         break
+        # except Exception as e:
+        #     logging.error("校验配置报错" + repr(e))
         # 校验 Package.json 及 Hexo
         if pack:
             try:
@@ -695,31 +730,27 @@ def verify_provider(provider):
                     if content.get("hexo"):
                         if content["hexo"].get("version"):
                             hexo = content["hexo"].get("version")
-                            logging.info("检测到Hexo版本: " + hexo)
                     if content.get("dependencies"):
                         if content["dependencies"].get("hexo"):
                             hexo = content["dependencies"].get("hexo")
-                            logging.info("检测到Hexo版本: " + hexo)
             except Exception as e:
-                logging.error("校验配置报错" + repr(e))
+                logging.error(gettext("PROVIDER_VERIFY_ERROR") + ": " + repr(e))
         # 总结校验
-        if hexo and config_hexo and (not indexhtml) and source and theme and pack and config_theme:
+        if hexo and config_hexo and (not indexhtml) and source and pack:
             status = 1
         result = {
             "status": status,
             "hexo": hexo,
-            "config_theme": config_theme,
             "config_hexo": config_hexo,
             "indexhtml": indexhtml,
             "source": source,
-            "theme": theme,
             "theme_dir": theme_dir,
             "package": pack,
         }
-        logging.info("Provider校验结果: " + str(result))
+        logging.info(gettext("PROVIDER_VERIFY_SUCCESS").format(str(result)))
         return result
     except Exception as e:
-        logging.error("校验配置出错: " + repr(e))
+        logging.error(gettext("PROVIDER_VERIFY_ERROR") + ": " + repr(e))
         return {"status": -1}
 
 
@@ -731,20 +762,25 @@ def get_post_details(article, safe=True):
             article = ";;;\n" + article
         elif "---" in article:
             article = "---\n" + article
+        else:
+            flag = False
     abbrlink = get_crc_by_time(str(time()), get_setting("ABBRLINK_ALG"), get_setting("ABBRLINK_REP"))
     dateformat = datetime.now(timezone.utc).astimezone().isoformat()
     try:
         if article[:3] == "---":
             front_matter = re.search(r"---([\s\S]*?)---", article, flags=0).group()[3:-4]
-            front_matter = front_matter.replace("{{ date }}", dateformat).replace("{{ abbrlink }}", abbrlink).replace("{{ slug }}",
-                                                                                                                      abbrlink).replace("{",
-                                                                                                                                        "").replace(
+            front_matter = front_matter.replace("{{ date }}", dateformat).replace("{{ abbrlink }}", abbrlink).replace(
+                "{{ slug }}",
+                abbrlink).replace("{",
+                                  "").replace(
                 "}", "")
             front_matter = yaml.safe_load(front_matter)
         elif article[:3] == ";;;":
             front_matter = json.loads("{{{}}}".format(
-                re.search(r";;;([\s\S]*?);;;", article, flags=0).group()[3:-4].replace("{{ date }}", dateformat).replace("{{ abbrlink }}",
-                                                                                                                         abbrlink).replace(
+                re.search(r";;;([\s\S]*?);;;", article, flags=0).group()[3:-4].replace("{{ date }}",
+                                                                                       dateformat).replace(
+                    "{{ abbrlink }}",
+                    abbrlink).replace(
                     "{{ slug }}", abbrlink)))
         else:
             front_matter = {}
@@ -752,7 +788,8 @@ def get_post_details(article, safe=True):
         if flag:
             article = article[3:]
         return {}, repr(article).replace("<", "\\<").replace(">", "\\>").replace("!", "\\!") if safe else article
-    if not front_matter:
+    if not isinstance(front_matter, dict) or not front_matter:
+        logging.info(gettext("FRONT_MATTER_GET_ERROR").format(front_matter))
         front_matter = {}
         if flag:
             article = article[3:]
@@ -764,202 +801,263 @@ def get_post_details(article, safe=True):
             elif type(front_matter.get(key)) == date:
                 front_matter[key] = front_matter[key].isoformat()
         if safe:
-            passage = repr(re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]).replace("<", "\\<").replace(">",
-                                                                                                                              "\\>").replace(
+            passage = repr(re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]).replace("<",
+                                                                                                          "\\<").replace(
+                ">",
+                "\\>").replace(
                 "!", "\\!")
         else:
             passage = re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]
     return front_matter, passage
 
 
+def _export_model_data(model_class, field_mapping=None):
+    """
+    通用导出函数，从数据库获取指定模型的所有记录并转换为字典列表
+
+    Args:
+        model_class: 要导出的模型类
+        field_mapping: 字段映射函数，用于自定义每条记录如何转换为字典
+
+    Returns:
+        包含所有记录数据的字典列表
+    """
+    all_items = model_class.objects.all()
+    result = []
+
+    for item in all_items:
+        if field_mapping:
+            result.append(field_mapping(item))
+        else:
+            # 默认映射逻辑，获取所有字段
+            item_dict = {}
+            for field in item._meta.fields:
+                field_name = field.name
+                item_dict[field_name] = getattr(item, field_name)
+            result.append(item_dict)
+
+    return result
+
+
 def export_settings():
-    all_settings = SettingModel.objects.all()
-    settings = list()
-    for setting in all_settings:
-        settings.append({"name": setting.name, "content": setting.content})
-    return settings
+    return _export_model_data(
+        SettingModel,
+        lambda item: {"name": item.name, "content": item.content}
+    )
 
 
 def export_images():
-    all_settings = ImageModel.objects.all()
-    settings = list()
-    for setting in all_settings:
-        settings.append({"name": setting.name, "url": setting.url, "size": setting.size, "date": setting.date, "type": setting.type,
-                         "deleteConfig": setting.deleteConfig})
-    return settings
+    return _export_model_data(
+        ImageModel,
+        lambda item: {
+            "name": item.name,
+            "url": item.url,
+            "size": item.size,
+            "date": item.date,
+            "type": item.type,
+            "deleteConfig": item.deleteConfig
+        }
+    )
 
 
 def export_friends():
-    all_ = FriendModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"name": s.name, "url": s.url, "imageUrl": s.imageUrl, "time": s.time, "description": s.description, "status": s.status})
-    return ss
+    return _export_model_data(
+        FriendModel,
+        lambda item: {
+            "name": item.name,
+            "url": item.url,
+            "imageUrl": item.imageUrl,
+            "time": item.time,
+            "description": item.description,
+            "status": item.status
+        }
+    )
 
 
 def export_notifications():
-    all_ = NotificationModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"time": s.time, "label": s.label, "content": s.content})
-    return ss
+    return _export_model_data(
+        NotificationModel,
+        lambda item: {"time": item.time, "label": item.label, "content": item.content}
+    )
 
 
 def export_customs():
-    all_ = CustomModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"name": s.name, "content": s.content})
-    return ss
+    return _export_model_data(
+        CustomModel,
+        lambda item: {"name": item.name, "content": item.content}
+    )
 
 
 def export_uv():
-    all_ = StatisticUV.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"ip": s.ip})
-    return ss
+    return _export_model_data(
+        StatisticUV,
+        lambda item: {"ip": item.ip}
+    )
 
 
 def export_pv():
-    all_ = StatisticPV.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"url": s.url, "number": s.number})
-    return ss
+    return _export_model_data(
+        StatisticPV,
+        lambda item: {"url": item.url, "number": item.number}
+    )
 
 
 def export_talks():
-    all_ = TalkModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"content": s.content, "tags": s.tags, "time": s.time, "like": s.like})
-    return ss
+    return _export_model_data(
+        TalkModel,
+        lambda item: {"content": item.content, "tags": item.tags, "time": item.time, "like": item.like}
+    )
 
 
 def export_posts():
-    all_ = PostModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append(
-            {"title": s.title, "path": s.path, "status": s.status, "front_matter": s.front_matter, "date": s.date, "filename": s.filename})
-    return ss
+    return _export_model_data(
+        PostModel,
+        lambda item: {
+            "title": item.title,
+            "path": item.path,
+            "status": item.status,
+            "front_matter": item.front_matter,
+            "date": item.date,
+            "filename": item.filename
+        }
+    )
+
+
+def _bulk_import(model_class, data, field_mapping_func, model_name):
+    """通用批量导入函数"""
+    try:
+        # 删除现有数据
+        model_class.objects.all().delete()
+
+        # 批量创建新对象
+        objects = [field_mapping_func(item) for item in data]
+        model_class.objects.bulk_create(objects)
+
+        logging.info(gettext("IMPORT_SUCCESS").format(model_name))
+        return True
+    except Exception as e:
+        logging.error(gettext("IMPORT_FAILED").format(model_name, str(e)))
+        return False
 
 
 def import_settings(ss):
-    for s in ss:
-        save_setting(s["name"], s["content"])
-    return True
+    return _bulk_import(
+        SettingModel,
+        ss,
+        lambda s: SettingModel(
+            name=s["name"],
+            content=s["content"]
+        ),
+        "设置"
+    )
 
 
 def import_images(ss):
-    _all = ImageModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        image = ImageModel()
-        image.name = s["name"]
-        image.url = s["url"]
-        image.size = s["size"]
-        image.date = s["date"]
-        image.type = s["type"]
-        image.deleteConfig = s["deleteConfig"]
-        image.save()
-    return True
+    return _bulk_import(
+        ImageModel,
+        ss,
+        lambda s: ImageModel(
+            name=s["name"],
+            url=s["url"],
+            size=s["size"],
+            date=s["date"],
+            type=s["type"],
+            deleteConfig=s["deleteConfig"]
+        ),
+        "图片"
+    )
 
 
 def import_friends(ss):
-    _all = FriendModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        friend = FriendModel()
-        friend.name = s["name"]
-        friend.url = s["url"]
-        friend.imageUrl = s["imageUrl"]
-        friend.time = s["time"]
-        friend.description = s["description"]
-        friend.status = s["status"]
-        friend.save()
-    return True
+    return _bulk_import(
+        FriendModel,
+        ss,
+        lambda s: FriendModel(
+            name=s["name"],
+            url=s["url"],
+            imageUrl=s["imageUrl"],
+            time=s["time"],
+            description=s["description"],
+            status=s["status"]
+        ),
+        "友链"
+    )
 
 
 def import_notifications(ss):
-    _all = NotificationModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        notification = NotificationModel()
-        notification.time = s["time"]
-        notification.label = s["label"]
-        notification.content = s["content"]
-        notification.save()
-    return True
+    return _bulk_import(
+        NotificationModel,
+        ss,
+        lambda s: NotificationModel(
+            time=s["time"],
+            label=s["label"],
+            content=s["content"]
+        ),
+        "通知"
+    )
 
 
 def import_custom(ss):
-    _all = CustomModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        custom = CustomModel()
-        custom.name = s["name"]
-        custom.content = s["content"]
-        custom.save()
-    return True
+    return _bulk_import(
+        CustomModel,
+        ss,
+        lambda s: CustomModel(
+            name=s["name"],
+            content=s["content"]
+        ),
+        "自定义"
+    )
 
 
 def import_uv(ss):
-    _all = StatisticUV.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        uv = StatisticUV()
-        uv.ip = s["ip"]
-        uv.save()
-    return True
+    return _bulk_import(
+        StatisticUV,
+        ss,
+        lambda s: StatisticUV(ip=s["ip"]),
+        "UV统计"
+    )
 
 
 def import_pv(ss):
-    _all = StatisticPV.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        pv = StatisticPV()
-        pv.url = s["url"]
-        pv.number = s["number"]
-        pv.save()
-    return True
+    return _bulk_import(
+        StatisticPV,
+        ss,
+        lambda s: StatisticPV(
+            url=s["url"],
+            number=s["number"]
+        ),
+        "PV统计"
+    )
 
 
 def import_talks(ss):
-    _all = TalkModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        talk = TalkModel()
-        talk.content = s["content"]
-        talk.tags = s["tags"]
-        talk.time = s["time"]
-        talk.like = s["like"]
-        talk.save()
-    return True
+    return _bulk_import(
+        TalkModel,
+        ss,
+        lambda s: TalkModel(
+            content=s["content"],
+            tags=s["tags"],
+            time=s["time"],
+            like=s["like"]
+        ),
+        "说说"
+    )
 
 
 def import_posts(ss):
-    _all = PostModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        post = PostModel()
-        post.title = s["title"]
-        post.path = s["path"]
-        post.status = s["status"]
-        post.front_matter = s["front_matter"]
-        post.date = s["date"]
-        post.filename = s["filename"]
-        post.save()
-    return True
+    return _bulk_import(
+        PostModel,
+        ss,
+        lambda s: PostModel(
+            title=s["title"],
+            path=s["path"],
+            status=s["status"],
+            front_matter=s["front_matter"],
+            date=s["date"],
+            filename=s["filename"]
+        ),
+        "文章"
+    )
 
 
 def excerpt_post(content, length, mark=True):
@@ -992,31 +1090,31 @@ def mark_post(path, front_matter, status, filename):
     if p:
         p.first().delete()
         PostModel.objects.create(
-            title=front_matter.get("title") if front_matter.get("title") else "未命名",
+            title=front_matter.get("title") if front_matter.get("title") else gettext("UNTITLED"),
             path=path,
             status=status,
             front_matter=json.dumps(front_matter),
             date=time(),
             filename=filename
         )
-        logging.info(f"更新文章详情索引：{path}")
+        logging.info(f"{gettext('UPDATE_POST_INDEX')}：{path}")
     else:
         PostModel.objects.create(
-            title=front_matter.get("title") if front_matter.get("title") else "未命名",
+            title=front_matter.get("title") if front_matter.get("title") else gettext("UNTITLED"),
             path=path,
             status=status,
             front_matter=json.dumps(front_matter),
             date=time(),
             filename=filename
         )
-        logging.info(f"创建文章详情索引：{path}")
+        logging.info(f"{gettext('UPDATE_POST_INDEX')}：{path}")
 
 
 def del_postmark(path):
     p = PostModel.objects.filter(path=path)
     if p:
         p.first().delete()
-        logging.info(f"删除文章详情索引：{path}")
+        logging.info(f"{gettext('DEL_POST_INDEX')}：{path}")
 
 
 def del_all_postmark():
@@ -1035,6 +1133,20 @@ def convert_to_kb_mb_gb(size_in_bytes):
         return f"{kb:.2f} KB"
     else:
         return f"{size_in_bytes} B"
+
+
+def get_domain_and_path(url):
+    if url[:7] == "http://":
+        url = url[7:]
+    elif url[:8] == "https://":
+        url = url[8:]
+    domain = url.split("/")[0]
+    # 过滤参数
+    url = url.split("?")[0].split("#")[0]
+    return domain, url
+
+def get_db_config():
+    return DATABASES["default"]["ENGINE"]
 
 
 # print(" ......................阿弥陀佛......................\n" +
@@ -1059,24 +1171,26 @@ def convert_to_kb_mb_gb(size_in_bytes):
 #       "                                                    \n" +
 #       "....................佛祖保佑 ,永无BUG...................")
 
+import platform as pf
+
 print("           _               _ \n" +
       "     /\\   | |             | |\n" +
       "    /  \\  | |__  _   _  __| |_   _ \n" +
       "   / /\\ \\ | |_ \\| | | |/ _| | | | |\n" +
       "  / ____ \\| |_) | |_| | (_| | |_| |\n" +
       " /_/    \\_\\____/ \\____|\\____|\\____|")
-
-print("当前环境: " + ("Vercel" if check_if_vercel() else "本地"))
+print(gettext("CURRENT_ENV") + ": " + ("Vercel" if check_if_vercel() else gettext("LOCAL")) + " / " + (
+    "Docker" if check_if_docker() else pf.system()) + " / Qexo " + QEXO_VERSION + " / Python " + pf.python_version() + " / " + get_db_config())
 
 if check_if_vercel():
     logging.info = logging.warn
 
 UPDATE_FROM = get_setting("UPDATE_FROM")
 if UPDATE_FROM != "false" and UPDATE_FROM != "true" and UPDATE_FROM != QEXO_VERSION and UPDATE_FROM:
-    logging.info(f"开始运行自动更新迁移程序...来自{UPDATE_FROM}")
+    logging.info(gettext("ELEVATOR_START").format(UPDATE_FROM))
     try:
         elevator.elevator(UPDATE_FROM, QEXO_VERSION)
     except Exception as e:
-        logging.error("自动更新迁移程序出错: " + str(e))
+        logging.error(gettext("ELEVATOR_ERROR").format(str(e)))
     save_setting("UPDATE_FROM", QEXO_VERSION)
     save_setting("JUMP_UPDATE", "true")
