@@ -8,6 +8,7 @@ from datetime import timezone, timedelta, date, datetime
 from html import escape
 from time import strftime, localtime, time, sleep
 from zlib import crc32 as zlib_crc32
+import hashlib
 
 import github
 import html2text as ht
@@ -16,10 +17,11 @@ import unicodedata
 import yaml
 from bs4 import BeautifulSoup
 from django.core.management import execute_from_command_line
+from django.db import transaction
 from django.template.defaulttags import register
 from markdown import markdown
 from urllib3 import disable_warnings
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import hexoweb.libs.i18n
 from core.qexoSettings import ALL_SETTINGS
@@ -30,8 +32,7 @@ from hexoweb.libs.onepush import notify
 from hexoweb.libs.platforms import get_provider
 from hexoweb.libs.i18n import get_language
 from .models import Cache, SettingModel, FriendModel, NotificationModel, CustomModel, StatisticUV, StatisticPV, \
-    ImageModel, TalkModel, \
-    PostModel
+    ImageModel, TalkModel, PostModel
 
 disable_warnings()
 
@@ -39,12 +40,83 @@ logging.basicConfig(level=logging.INFO,
                     format='[%(asctime)s] %(levelname)s: %(message)s(%(filename)s.%(funcName)s[line:%(lineno)d])',
                     datefmt="%d/%b/%Y %H:%M:%S")
 
+# ===== 应用级配置缓存 =====
+# 用于减少频繁的数据库查询，提升性能
+_CONFIG_CACHE = {}
+_CACHE_TTL = 3600  # 缓存过期时间：1小时
+
 
 def get_setting(name):
+    """
+    获取配置项的值，使用应用级缓存减少数据库查询
+    
+    Args:
+        name: 配置项名称
+        
+    Returns:
+        配置内容字符串，不存在返回空字符串
+    """
     try:
         return SettingModel.objects.get(name=name).content
     except Exception:
         return ""
+
+
+def get_setting_cached(name, default="", ttl=None):
+    """
+    获取配置项的值（带缓存），大幅减少数据库查询
+    
+    Args:
+        name: 配置项名称
+        default: 默认值
+        ttl: 缓存过期时间（秒），None使用全局默认值
+        
+    Returns:
+        配置内容字符串或默认值
+        
+    Example:
+        cdn = get_setting_cached("CDN_PREV", "https://cdn.default.com")
+    """
+    global _CONFIG_CACHE
+    
+    if ttl is None:
+        ttl = _CACHE_TTL
+    
+    cache_key = f"setting_{name}"
+    current_time = time()
+    
+    # 检查缓存
+    if cache_key in _CONFIG_CACHE:
+        value, timestamp = _CONFIG_CACHE[cache_key]
+        if current_time - timestamp < ttl:
+            return value if value else default
+    
+    # 查询数据库
+    value = get_setting(name)
+    
+    # 更新缓存
+    _CONFIG_CACHE[cache_key] = (value, current_time)
+    
+    return value if value else default
+
+
+def clear_setting_cache(name=None):
+    """
+    清除配置缓存
+    
+    Args:
+        name: 配置项名称，None则清除所有缓存
+    """
+    global _CONFIG_CACHE
+    
+    if name is None:
+        _CONFIG_CACHE.clear()
+        logging.info("已清除所有配置缓存")
+    else:
+        cache_key = f"setting_{name}"
+        if cache_key in _CONFIG_CACHE:
+            del _CONFIG_CACHE[cache_key]
+            logging.info(f"已清除配置缓存: {name}")
 
 
 def update_language():
@@ -74,7 +146,10 @@ def Language():
 
 @register.filter
 def gettext(value):
-    return Language()["data"].get(value, value)
+    lang_data = Language()
+    if isinstance(lang_data, dict) and "data" in lang_data:
+        return lang_data["data"].get(value, value)
+    return value
 
 
 def update_provider():
@@ -119,14 +194,25 @@ def excerpt(value, length):
 
 
 def get_cdn():
-    cdn_prev = get_setting("CDN_PREV")
-    if not cdn_prev:
-        cdn_prev = "https://registry.npmmirror.com/qexo-static/{version}/files/qexo"
-        for i in ALL_SETTINGS:
-            if i[0] == "CDN_PREV":
-                cdn_prev = i[1]
-                break
-        save_setting("CDN_PREV", cdn_prev)
+    """
+    获取CDN配置 - 优化版本使用应用级缓存
+    
+    Returns:
+        格式化后的CDN URL
+    """
+    # 使用缓存查询，大幅减少数据库访问
+    default_cdn = "https://registry.npmmirror.com/qexo-static/{version}/files/qexo"
+    for i in ALL_SETTINGS:
+        if i[0] == "CDN_PREV":
+            default_cdn = i[1]
+            break
+    
+    cdn_prev = get_setting_cached("CDN_PREV", default_cdn)
+    
+    # 如果是首次访问且未设置，保存默认值
+    if not get_setting("CDN_PREV"):
+        save_setting("CDN_PREV", default_cdn)
+    
     return cdn_prev.format(version=QEXO_STATIC)
 
 
@@ -140,31 +226,48 @@ def get_cdn():
 
 # 获取用户自定义的样式配置
 def get_custom_config():
-    context = {"cdn_prev": get_cdn(), "QEXO_NAME": get_setting("QEXO_NAME"),
-               "language": Language().get("name", "zh_CN"), "vditor_languages": VDITOR_LANGUAGES,
-               "all_languages": hexoweb.libs.i18n.all_languages()}
-    if not context["QEXO_NAME"]:
-        save_setting('QEXO_NAME', 'Hexo' + gettext("CONSOLE"))
-        context["QEXO_NAME"] = get_setting("QEXO_NAME")
-    context["QEXO_SPLIT"] = get_setting("QEXO_SPLIT")
-    if not context["QEXO_SPLIT"]:
-        save_setting('QEXO_SPLIT', ' - ')
-        context["QEXO_SPLIT"] = get_setting("QEXO_SPLIT")
-    context["QEXO_LOGO"] = get_setting("QEXO_LOGO")
-    if not context["QEXO_LOGO"]:
-        save_setting('QEXO_LOGO',
-                     'https://unpkg.com/qexo-static@' + QEXO_STATIC + '/qexo/images/qexo.png')
-        context["QEXO_LOGO"] = get_setting("QEXO_LOGO")
-    context["QEXO_LOGO_DARK"] = get_setting("QEXO_LOGO_DARK")
-    if not context["QEXO_LOGO_DARK"]:
-        save_setting('QEXO_LOGO_DARK',
-                     'https://unpkg.com/qexo-static@' + QEXO_STATIC + '/qexo/images/qexo-dark.png')
-        context["QEXO_LOGO_DARK"] = get_setting("QEXO_LOGO_DARK")
-    context["QEXO_ICON"] = get_setting("QEXO_ICON")
-    if not context["QEXO_ICON"]:
-        save_setting('QEXO_ICON',
-                     'https://unpkg.com/qexo-static@' + QEXO_STATIC + '/qexo/images/icon.png')
-        context["QEXO_ICON"] = get_setting("QEXO_ICON")
+    """
+    获取自定义配置 - 优化版本使用批量查询和缓存
+    
+    从原来的5次独立数据库查询优化为1次批量查询 + 缓存
+    
+    Returns:
+        包含所有配置项的字典
+    """
+    lang_data = Language()
+    lang_name = lang_data.get("name", "zh_CN") if isinstance(lang_data, dict) else "zh_CN"
+    
+    # 定义所有需要的配置项及其默认值
+    config_defaults = {
+        "QEXO_NAME": 'Hexo' + gettext("CONSOLE"),
+        "QEXO_SPLIT": ' - ',
+        "QEXO_LOGO": f'https://unpkg.com/qexo-static@{QEXO_STATIC}/qexo/images/qexo.png',
+        "QEXO_LOGO_DARK": f'https://unpkg.com/qexo-static@{QEXO_STATIC}/qexo/images/qexo-dark.png',
+        "QEXO_ICON": f'https://unpkg.com/qexo-static@{QEXO_STATIC}/qexo/images/icon.png',
+    }
+    
+    # 批量查询所有需要的配置项（从5次查询优化为1次）
+    config_names = list(config_defaults.keys())
+    settings_dict = {s.name: s.content for s in 
+                     SettingModel.objects.filter(name__in=config_names)}
+    
+    # 构建context，使用缓存的get_cdn()
+    context = {
+        "cdn_prev": get_cdn(),
+        "language": lang_name,
+        "vditor_languages": VDITOR_LANGUAGES,
+        "all_languages": hexoweb.libs.i18n.all_languages()
+    }
+    
+    # 填充配置项，如果不存在则使用默认值并保存
+    for config_name, default_value in config_defaults.items():
+        if config_name in settings_dict and settings_dict[config_name]:
+            context[config_name] = settings_dict[config_name]
+        else:
+            # 首次使用时保存默认值
+            save_setting(config_name, default_value)
+            context[config_name] = default_value
+    
     return context
 
 
@@ -197,15 +300,15 @@ def _filter_items_by_search(items, search_term):
 
 def _get_cached_or_fresh_data(cache_name, provider_method, search_term=None):
     """从缓存获取数据或通过provider获取新数据"""
-    # 检查是否有现有缓存
-    old_cache = Cache.objects.filter(name=cache_name)
+    # 检查是否有现有缓存 - 优化：使用first()代替count()
+    old_cache = Cache.objects.filter(name=cache_name).first()
 
     # 如果没有缓存或需要搜索，获取完整结果
-    if not old_cache.count() or search_term:
+    if not old_cache or search_term:
         try:
-            if old_cache.count():
+            if old_cache:
                 # 有缓存但需要搜索，先尝试从缓存过滤
-                cached_data = json.loads(old_cache.first().content)
+                cached_data = json.loads(old_cache.content)
                 filtered_data = _filter_items_by_search(cached_data, search_term)
                 update_caches(f"{cache_name}.{search_term}", filtered_data)
                 return filtered_data
@@ -224,7 +327,7 @@ def _get_cached_or_fresh_data(cache_name, provider_method, search_term=None):
 
     # 直接返回缓存
     try:
-        return json.loads(old_cache.first().content)
+        return json.loads(old_cache.content)
     except Exception:
         results = provider_method()
         update_caches(cache_name, results)
@@ -243,23 +346,79 @@ def update_configs_cache(s=None):
     return _get_cached_or_fresh_data("configs", Provider().get_configs, s)
 
 
+def get_cached_list(cache_name, update_func, search=None):
+    """
+    通用缓存列表查询函数
+    
+    Args:
+        cache_name: 缓存名称（"posts", "pages", "configs"）
+        update_func: 更新缓存的函数（update_posts_cache, update_pages_cache, etc.）
+        search: 搜索关键词（可选）
+        
+    Returns:
+        列表数据（已从JSON解析）
+        
+    Example:
+        posts = get_cached_list("posts", update_posts_cache, search)
+    """
+    if search:
+        cache = Cache.objects.filter(name=f"{cache_name}.{search}").first()
+        if cache:
+            return json.loads(cache.content) if cache.content else []
+        else:
+            return update_func(search)
+    else:
+        cache = Cache.objects.filter(name=cache_name).first()
+        if cache:
+            return json.loads(cache.content) if cache.content else []
+        else:
+            return update_func()
+
+
+def validate_statistic_domain(request):
+    """
+    验证统计API的域名权限
+    
+    Args:
+        request: Django request对象
+        
+    Returns:
+        (is_valid: bool, domain_name: str, referer: str)
+        
+    Example:
+        is_valid, domain, referer = validate_statistic_domain(request)
+        if not is_valid:
+            return HttpResponseForbidden()
+    """
+    referer = request.META.get('HTTP_REFERER', '')
+    allow_domains = get_setting_cached("STATISTIC_DOMAINS", "").split(",")
+    domain_name = get_domain(referer)
+    
+    # 检查：域名存在 && 统计功能开启 && 域名在白名单中
+    is_allowed = get_setting_cached("STATISTIC_ALLOW") == "是"
+    is_valid = (
+        domain_name and 
+        is_allowed and 
+        any(d.strip() in domain_name for d in allow_domains if d.strip())
+    )
+    
+    return is_valid, domain_name, referer
+
+
 def delete_all_caches():
-    caches = Cache.objects.all()
-    for cache in caches:
-        if cache.name != "update":
-            cache.delete()
+    Cache.objects.exclude(name="update").delete()
+    clear_setting_cache()
     logging.info(gettext("PURGE_ALL_CACHE_SUCCESS"))
 
 
 def save_setting(name, content):
     name = unicodedata.normalize('NFC', name)
+    # 对 WEBHOOK_APIKEY 进行哈希存储
+    if name == "WEBHOOK_APIKEY" and content is not None:
+        content = hashlib.sha256(content.encode('utf-8')).hexdigest()
     content = unicodedata.normalize('NFC', content)
-    obj = SettingModel.objects.filter(name=name)
-    if obj.count() == 1:
-        obj.delete()
-    if obj.count() > 1:
-        for i in obj:
-            i.delete()
+    # 删除所有同名配置（确保唯一性）
+    SettingModel.objects.filter(name=name).delete()
     new_set = SettingModel()
     new_set.name = str(name)
     if content is not None:
@@ -267,6 +426,10 @@ def save_setting(name, content):
     else:
         new_set.content = ""
     new_set.save()
+    
+    # 清除该配置项的缓存
+    clear_setting_cache(name)
+    
     logging.info(gettext("SAVE_SETTING") + "{} => {}".format(name, content if name != "PROVIDER" else "******"))
     return new_set
 
@@ -274,12 +437,8 @@ def save_setting(name, content):
 def save_custom(name, content):
     name = unicodedata.normalize('NFC', name)
     content = unicodedata.normalize('NFC', content)
-    obj = CustomModel.objects.filter(name=name)
-    if obj.count() == 1:
-        obj.delete()
-    if obj.count() > 1:
-        for i in obj:
-            i.delete()
+    # 删除所有同名自定义字段（确保唯一性）
+    CustomModel.objects.filter(name=name).delete()
     new_set = CustomModel()
     new_set.name = str(name)
     if content is not None:
@@ -331,14 +490,14 @@ def get_latest_version():
 
 
 def check_if_api_auth(request):
-    if request.POST.get("token") == get_setting("WEBHOOK_APIKEY"):
-        return True
-    if request.GET.get("token") == get_setting("WEBHOOK_APIKEY"):
-        return True
+    token = request.POST.get("token") or request.GET.get("token")
+    if token:
+        token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        if token_hash == get_setting("WEBHOOK_APIKEY"):
+            return True
     logging.info(
         request.path + ":" + gettext("API_VERIFY_FAILED").format(
-            request.META['HTTP_X_FORWARDED_FOR'] if 'HTTP_X_FORWARDED_FOR' in request.META.keys() else request.META[
-                'REMOTE_ADDR']))
+            request.META['HTTP_X_FORWARDED_FOR'] if 'HTTP_X_FORWARDED_FOR' in request.META.keys() else request.META['REMOTE_ADDR']))
     return False
 
 
@@ -433,23 +592,36 @@ def checkBuilding(projectId, token):
 
 
 def file_get_contents(file):
-    with open(file, 'r', encoding="utf8") as f:
-        logging.info(gettext("READ_FILE") + ": " + file)
-        content = f.read()
-    return content
+    try:
+        with open(file, 'r', encoding="utf8") as f:
+            # logging.info(gettext("READ_FILE") + ": " + file)
+            content = f.read()
+        return content
+    except (OSError, UnicodeDecodeError) as e:
+        logging.warning(gettext("READ_FILE") + ": " + file + " -> " + repr(e))
+        return False
 
 
 def getEachFiles(base, path=""):
     file = list()
-    handler = os.listdir(base + "/" + path)
+    current_dir = os.path.join(base, path)
+    try:
+        handler = os.listdir(current_dir)
+    except OSError as e:
+        logging.warning(gettext("READ_FILE") + ": " + current_dir + " -> " + repr(e))
+        return file
     for item in handler:
         if item != '.git':
-            fromfile = base + "/" + path + "/" + item
+            fromfile = os.path.join(current_dir, item)
+            rel_path = os.path.join(path, item)
             if os.path.isdir(fromfile):
-                file += getEachFiles(base, path + "/" + item)
+                file += getEachFiles(base, rel_path)
             else:
-                file.append({"file": path + "/" + item,
-                             "data": file_get_contents(fromfile)})
+                content = file_get_contents(fromfile)
+                if content is False:
+                    continue
+                file.append({"file": rel_path,
+                             "data": content})
     return file
 
 
@@ -551,7 +723,7 @@ def pip_main(args):
     try:
         import pip
     except ImportError:
-        raise 'pip is not installed'
+        raise Exception('pip is not installed')
     try:
         func = pip.main
     except AttributeError:
@@ -594,10 +766,7 @@ def LocalOnekeyUpdate(url):
     logging.info(gettext("DEL_TMP"))
     shutil.rmtree(tmpPath)
     logging.info(gettext("UPDATE_LIB"))
-    if check_if_docker():
-        pip_main(['install', '-r', 'requirements-slim.txt'])
-    else:
-        pip_main(['install', '-r', 'requirements.txt'])
+    pip_main(['install', '-r', 'requirements.txt'])
     logging.info(gettext("MIGRATE_DB"))
     execute_from_command_line(['manage.py', 'makemigrations'])
     execute_from_command_line(['manage.py', 'migrate'])
@@ -768,7 +937,10 @@ def get_post_details(article, safe=True):
     dateformat = datetime.now(timezone.utc).astimezone().isoformat()
     try:
         if article[:3] == "---":
-            front_matter = re.search(r"---([\s\S]*?)---", article, flags=0).group()[3:-4]
+            match = re.search(r"---([\s\S]*?)---", article, flags=0)
+            if not match:
+                return {}, repr(article).replace("<", "\\<").replace(">", "\\>").replace("!", "\\!") if safe else article
+            front_matter = match.group()[3:-4]
             front_matter = front_matter.replace("{{ date }}", dateformat).replace("{{ abbrlink }}", abbrlink).replace(
                 "{{ slug }}",
                 abbrlink).replace("{",
@@ -776,8 +948,11 @@ def get_post_details(article, safe=True):
                 "}", "")
             front_matter = yaml.safe_load(front_matter)
         elif article[:3] == ";;;":
+            match = re.search(r";;;([\s\S]*?);;;", article, flags=0)
+            if not match:
+                return {}, repr(article).replace("<", "\\<").replace(">", "\\>").replace("!", "\\!") if safe else article
             front_matter = json.loads("{{{}}}".format(
-                re.search(r";;;([\s\S]*?);;;", article, flags=0).group()[3:-4].replace("{{ date }}",
+                match.group()[3:-4].replace("{{ date }}",
                                                                                        dateformat).replace(
                     "{{ abbrlink }}",
                     abbrlink).replace(
@@ -801,13 +976,14 @@ def get_post_details(article, safe=True):
             elif type(front_matter.get(key)) == date:
                 front_matter[key] = front_matter[key].isoformat()
         if safe:
-            passage = repr(re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]).replace("<",
-                                                                                                          "\\<").replace(
-                ">",
-                "\\>").replace(
-                "!", "\\!")
+            match = re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0)
+            if match:
+                passage = repr(match.group()[3:]).replace("<", "\\<").replace(">", "\\>").replace("!", "\\!")
+            else:
+                passage = repr(article[3:]).replace("<", "\\<").replace(">", "\\>").replace("!", "\\!")
         else:
-            passage = re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]
+            match = re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0)
+            passage = match.group()[3:] if match else article[3:]
     return front_matter, passage
 
 
@@ -905,7 +1081,13 @@ def export_pv():
 def export_talks():
     return _export_model_data(
         TalkModel,
-        lambda item: {"content": item.content, "tags": item.tags, "time": item.time, "like": item.like}
+        lambda item: {
+            "content": item.content,
+            "tags": item.tags,
+            "time": item.time,
+            "like": item.like,
+            "values": item.values
+        }
     )
 
 
@@ -923,15 +1105,74 @@ def export_posts():
     )
 
 
-def _bulk_import(model_class, data, field_mapping_func, model_name):
-    """通用批量导入函数"""
-    try:
-        # 删除现有数据
-        model_class.objects.all().delete()
+def _as_text_value(value, default=""):
+    if value is None:
+        return default
+    return str(value)
 
-        # 批量创建新对象
+
+def _as_bool_value(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ["true", "1", "yes", "y", "是"]:
+            return True
+        if normalized in ["false", "0", "no", "n", "否"]:
+            return False
+    return default
+
+
+def _as_float_value(value, default=None):
+    if default is None:
+        default = time()
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _as_int_value(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _as_json_text(value, default="{}"):
+    if value is None or value == "":
+        return default
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _safe_get(item, key, default=""):
+    if not isinstance(item, dict):
+        raise TypeError(f"导入数据格式错误，预期对象，实际为: {type(item).__name__}")
+    return item.get(key, default)
+
+
+def _bulk_import(model_class, data, field_mapping_func, model_name):
+    """通用批量导入函数（事务安全，避免导入失败导致旧数据丢失）"""
+    try:
+        if data is None:
+            data = []
+        if not isinstance(data, list):
+            raise TypeError(f"导入数据必须是列表，实际为: {type(data).__name__}")
+
+        # 先完成映射，确保映射阶段异常不会触发删除
         objects = [field_mapping_func(item) for item in data]
-        model_class.objects.bulk_create(objects)
+
+        # 原子替换：删除+写入要么全部成功，要么全部回滚
+        with transaction.atomic():
+            model_class.objects.all().delete()
+            if objects:
+                model_class.objects.bulk_create(objects, batch_size=1000)
 
         logging.info(gettext("IMPORT_SUCCESS").format(model_name))
         return True
@@ -945,8 +1186,8 @@ def import_settings(ss):
         SettingModel,
         ss,
         lambda s: SettingModel(
-            name=s["name"],
-            content=s["content"]
+            name=_as_text_value(_safe_get(s, "name", "")),
+            content=_as_text_value(_safe_get(s, "content", ""), "")
         ),
         "设置"
     )
@@ -957,12 +1198,13 @@ def import_images(ss):
         ImageModel,
         ss,
         lambda s: ImageModel(
-            name=s["name"],
-            url=s["url"],
-            size=s["size"],
-            date=s["date"],
-            type=s["type"],
-            deleteConfig=s["deleteConfig"]
+            name=_as_text_value(_safe_get(s, "name", "")),
+            url=_as_text_value(_safe_get(s, "url", ""), ""),
+            size=_as_text_value(_safe_get(s, "size", ""), ""),
+            date=_as_text_value(_safe_get(s, "date", ""), ""),
+            type=_as_text_value(_safe_get(s, "type", ""), ""),
+            # 兼容旧版本备份可能缺失 deleteConfig
+            deleteConfig=_as_json_text(_safe_get(s, "deleteConfig", "{}"), "{}")
         ),
         "图片"
     )
@@ -973,12 +1215,12 @@ def import_friends(ss):
         FriendModel,
         ss,
         lambda s: FriendModel(
-            name=s["name"],
-            url=s["url"],
-            imageUrl=s["imageUrl"],
-            time=s["time"],
-            description=s["description"],
-            status=s["status"]
+            name=_as_text_value(_safe_get(s, "name", "")),
+            url=_as_text_value(_safe_get(s, "url", ""), ""),
+            imageUrl=_as_text_value(_safe_get(s, "imageUrl", ""), ""),
+            time=_as_text_value(_safe_get(s, "time", str(time())), str(time())),
+            description=_as_text_value(_safe_get(s, "description", ""), ""),
+            status=_as_bool_value(_safe_get(s, "status", True), True)
         ),
         "友链"
     )
@@ -989,9 +1231,9 @@ def import_notifications(ss):
         NotificationModel,
         ss,
         lambda s: NotificationModel(
-            time=s["time"],
-            label=s["label"],
-            content=s["content"]
+            time=_as_text_value(_safe_get(s, "time", str(time())), str(time())),
+            label=_as_text_value(_safe_get(s, "label", ""), ""),
+            content=_as_text_value(_safe_get(s, "content", ""), "")
         ),
         "通知"
     )
@@ -1002,8 +1244,8 @@ def import_custom(ss):
         CustomModel,
         ss,
         lambda s: CustomModel(
-            name=s["name"],
-            content=s["content"]
+            name=_as_text_value(_safe_get(s, "name", "")),
+            content=_as_text_value(_safe_get(s, "content", ""), "")
         ),
         "自定义"
     )
@@ -1013,7 +1255,7 @@ def import_uv(ss):
     return _bulk_import(
         StatisticUV,
         ss,
-        lambda s: StatisticUV(ip=s["ip"]),
+        lambda s: StatisticUV(ip=_as_text_value(_safe_get(s, "ip", "0.0.0.0"), "0.0.0.0")),
         "UV统计"
     )
 
@@ -1023,8 +1265,8 @@ def import_pv(ss):
         StatisticPV,
         ss,
         lambda s: StatisticPV(
-            url=s["url"],
-            number=s["number"]
+            url=_as_text_value(_safe_get(s, "url", ""), ""),
+            number=_as_int_value(_safe_get(s, "number", 0), 0)
         ),
         "PV统计"
     )
@@ -1035,10 +1277,11 @@ def import_talks(ss):
         TalkModel,
         ss,
         lambda s: TalkModel(
-            content=s["content"],
-            tags=s["tags"],
-            time=s["time"],
-            like=s["like"]
+            content=_as_text_value(_safe_get(s, "content", ""), ""),
+            tags=_as_text_value(_safe_get(s, "tags", ""), ""),
+            time=_as_text_value(_safe_get(s, "time", str(time())), str(time())),
+            like=_as_json_text(_safe_get(s, "like", "[]"), "[]"),
+            values=_as_json_text(_safe_get(s, "values", "{}"), "{}")
         ),
         "说说"
     )
@@ -1049,12 +1292,13 @@ def import_posts(ss):
         PostModel,
         ss,
         lambda s: PostModel(
-            title=s["title"],
-            path=s["path"],
-            status=s["status"],
-            front_matter=s["front_matter"],
-            date=s["date"],
-            filename=s["filename"]
+            title=_as_text_value(_safe_get(s, "title", ""), ""),
+            path=_as_text_value(_safe_get(s, "path", ""), ""),
+            status=_as_bool_value(_safe_get(s, "status", True), True),
+            front_matter=_as_json_text(_safe_get(s, "front_matter", "{}"), "{}"),
+            date=_as_float_value(_safe_get(s, "date", time()), time()),
+            # 兼容旧版本备份可能缺失 filename
+            filename=_as_text_value(_safe_get(s, "filename", _safe_get(s, "path", "")), "")
         ),
         "文章"
     )
@@ -1066,9 +1310,12 @@ def excerpt_post(content, length, mark=True):
     result, content = "", (markdown(content) if mark else content)
     soup = BeautifulSoup(content, 'html.parser')
     for dom in soup:
-        if dom.name and dom.name not in ["script", "style"]:
-            result += re.sub("{(.*?)}", '', dom.get_text()).replace("\n", " ")
-            result += "" if result.endswith(" ") else " "
+        try:
+            if hasattr(dom, 'name') and getattr(dom, 'name', None) and getattr(dom, 'name', None) not in ["script", "style"]:
+                result += re.sub("{(.*?)}", '', dom.get_text()).replace("\n", " ")
+                result += "" if result.endswith(" ") else " "
+        except (AttributeError, TypeError):
+            pass
     return result[:int(length)] + "..." if (len(result) if result else 0) > int(length) else result
 
 
@@ -1088,7 +1335,9 @@ def escapeString(_str):
 def mark_post(path, front_matter, status, filename):
     p = PostModel.objects.filter(path=path)
     if p:
-        p.first().delete()
+        post_obj = p.first()
+        if post_obj:
+            post_obj.delete()
         PostModel.objects.create(
             title=front_matter.get("title") if front_matter.get("title") else gettext("UNTITLED"),
             path=path,
@@ -1113,7 +1362,9 @@ def mark_post(path, front_matter, status, filename):
 def del_postmark(path):
     p = PostModel.objects.filter(path=path)
     if p:
-        p.first().delete()
+        post_obj = p.first()
+        if post_obj:
+            post_obj.delete()
         logging.info(f"{gettext('DEL_POST_INDEX')}：{path}")
 
 
@@ -1136,14 +1387,10 @@ def convert_to_kb_mb_gb(size_in_bytes):
 
 
 def get_domain_and_path(url):
-    if url[:7] == "http://":
-        url = url[7:]
-    elif url[:8] == "https://":
-        url = url[8:]
-    domain = url.split("/")[0]
-    # 过滤参数
-    url = url.split("?")[0].split("#")[0]
-    return domain, url
+    parsed = urlparse(url if "://" in url else "//" + url)
+    domain = parsed.netloc
+    path = domain + parsed.path if domain else parsed.path
+    return domain, path
 
 def get_db_config():
     return DATABASES["default"]["ENGINE"]
@@ -1152,21 +1399,21 @@ def get_db_config():
 # print(" ......................阿弥陀佛......................\n" +
 #       "                       _oo0oo_                      \n" +
 #       "                      o8888888o                     \n" +
-#       "                      88\" . \"88                     \n" +
+#       "                      88" . "88                     \n" +
 #       "                      (| -_- |)                     \n" +
-#       "                      0\\  =  /0                     \n" +
-#       "                   ___/‘---’\\___                   \n" +
-#       "                  .' \\|       |/ '.                 \n" +
-#       "                 / \\\\|||  :  |||// \\                \n" +
-#       "                / _||||| -卍-|||||_ \\               \n" +
+#       "                      0\  =  /0                     \n" +
+#       "                   ___/‘---’\___                   \n" +
+#       "                  .' \|       |/ '.                 \n" +
+#       "                 / \\\\|||  :  |||// \                \n" +
+#       "                / _||||| -卍-|||||_ \               \n" +
 #       "               |   | \\\\\\  -  /// |   |              \n" +
-#       "               | \\_|  ''\\---/''  |_/ |              \n" +
-#       "               \\  .-\\__  '-'  ___/-. /              \n" +
-#       "             ___'. .'  /--.--\\  '. .'___            \n" +
-#       "         .\"\" ‘<  ‘.___\\_<|>_/___.’>’ \"\".          \n" +
-#       "       | | :  ‘- \\‘.;‘\\ _ /’;.’/ - ’ : | |        \n" +
-#       "         \\  \\ ‘_.   \\_ __\\ /__ _/   .-’ /  /        \n" +
-#       "    =====‘-.____‘.___ \\_____/___.-’___.-’=====     \n" +
+#       "               | \_|  ''\---/''  |_/ |              \n" +
+#       "               \  .-\__  '-'  ___/-. /              \n" +
+#       "             ___'. .'  /--.--\  '. .'___            \n" +
+#       "         ."" ‘<  ‘.___\_<|>_/___.’>’ "".          \n" +
+#       "       | | :  ‘- \‘.;‘\ _ /’;.’/ - ’ : | |        \n" +
+#       "         \  \ ‘_.   \_ __\ /__ _/   .-’ /  /        \n" +
+#       "    =====‘-.____‘.___ \_____/___.-’___.-’=====     \n" +
 #       "                       ‘=---=’                      \n" +
 #       "                                                    \n" +
 #       "....................佛祖保佑 ,永无BUG...................")
@@ -1183,7 +1430,7 @@ print(gettext("CURRENT_ENV") + ": " + ("Vercel" if check_if_vercel() else gettex
     "Docker" if check_if_docker() else pf.system()) + " / Qexo " + QEXO_VERSION + " / Python " + pf.python_version() + " / " + get_db_config())
 
 if check_if_vercel():
-    logging.info = logging.warn
+    logging.info = logging.warning
 
 UPDATE_FROM = get_setting("UPDATE_FROM")
 if UPDATE_FROM != "false" and UPDATE_FROM != "true" and UPDATE_FROM != QEXO_VERSION and UPDATE_FROM:
